@@ -22,11 +22,11 @@ BODY: First 1500 characters of the email body, flattened to one line
 ## Requirements
 
 - Windows
-- Microsoft Outlook desktop app installed and set up with your mail profile (this does **not** work with Outlook web/OWA only — it needs the desktop COM interface)
+- Microsoft Outlook desktop app installed and set up with your mail profile (this does **not** work with Outlook web/OWA only it needs the desktop COM interface)
 
 ## Usage
 
-### Option A — Run the compiled app (easiest)
+### Option A Run the compiled app (easiest)
 
 1. Download `PullEmails.exe` from the [Releases](../../releases) page
 2. Double-click it
