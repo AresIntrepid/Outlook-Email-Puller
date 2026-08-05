@@ -1,6 +1,6 @@
 # Outlook Email Puller
 
-A small Windows tool that exports your last 7 days of Outlook inbox mail to a plain text file — useful for feeding into AI tools (like Claude with a connected folder) that can't read your inbox directly.
+A small Windows tool that exports your last 7 days of Outlook inbox mail to a plain text file useful for feeding into AI tools (like Claude with a connected folder) that can't read your inbox directly.
 
 ## What it does
 
@@ -30,10 +30,10 @@ BODY: First 1500 characters of the email body, flattened to one line
 
 1. Download `PullEmails.exe` from the [Releases](../../releases) page
 2. Double-click it
-3. Approve any Windows SmartScreen prompt ("More info" → "Run anyway") — this is expected for an unsigned exe
+3. Approve any Windows SmartScreen prompt ("More info" → "Run anyway")  this is expected for an unsigned exe
 4. Output lands at `C:\Users\<you>\weekly report\emails_raw_latest.txt`
 
-### Option B — Run the PowerShell script directly
+### Option B Run the PowerShell script directly
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File "pull_emails_portable.ps1"
@@ -48,7 +48,7 @@ To avoid running it manually every day, set up a Windows Task Scheduler job:
 
 ## Where the folder comes from
 
-The script auto-creates `weekly report` inside `%USERPROFILE%` (`C:\Users\<you>\weekly report`) if it doesn't already exist — no manual setup needed.
+The script auto-creates `weekly report` inside `%USERPROFILE%` (`C:\Users\<you>\weekly report`) if it doesn't already exist no manual setup needed.
 
 ## Using it with Claude / Cowork
 
