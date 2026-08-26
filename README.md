@@ -78,7 +78,31 @@ Connect the `weekly report` folder as a project folder in Claude Desktop (Cowork
 
 **Important:** connected folders aren't watched live — Claude can end up working from a cached view of a file instead of what's actually on disk right now. Build your instructions to explicitly say something like *"always re-read this file fresh — never rely on a cached or previously-read version"* rather than assuming it'll notice the file changed on its own.
 
-The exact project instructions and automation prompts used in the reference setup are in [`cowork-instructions.md`](./cowork-instructions.md) — copy them in as-is rather than reconstructing them from scratch.
+These same instructions also live in [`cowork-instructions.md`](./cowork-instructions.md) on their own, if you'd rather copy them from a dedicated file.
+
+### Project instructions
+
+Applies to every chat in the project, including ad-hoc one-off questions.
+
+```
+Emails are saved in three files in this folder: emails_today.txt (last 24 hours, the fastest and smallest), emails_recent.txt (last 10 days), and emails_history.txt (the complete, unbounded archive going back to when tracking started). Use emails_today.txt for anything about today or "since I last checked." Use emails_recent.txt for anything else recent — this week, the last several days — and as the default when I don't specify a period. Use emails_history.txt instead whenever I ask about a specific person or company by name — including phrasings like "full picture on X," "everything from X," "history with X," or "how many times has X emailed me" — or whenever I explicitly ask you to look back further than 10 days, or the answer isn't found in the other two files. When using emails_history.txt, search the entire file with no date cutoff unless I specify a range. All three files are updated outside this conversation by a scheduled script — always re-read them fresh each time; never rely on a cached or previously-read version. If necessary, update all three files using the exe/script provided in this folder. Never ask about connecting an email account.
+```
+
+### Daily automation
+
+Runs once a day. Reads `emails_today.txt`, which is already pre-filtered to the last 24 hours by the script, so no date filtering happens in the prompt itself.
+
+```
+Summarize the emails in the given period. Read emails_today.txt in this folder directly — never ask about connecting an email account. This file is updated outside this conversation by a scheduled script, so always re-read it fresh; never rely on a cached or previously-read version. It's a rolling window of the last 24 hours, appended in chronological order (oldest first, newest last) — include every entry in the file, since it's already limited to the right window. Title it "Inbox summary ([date range])". Group emails into these five sections, in this order, and include every section even if empty (say "None" rather than omitting it): Needs action — awaiting a reply or decision from me. Resolved — was actionable but already handled (note how/when). Overdue — deadline has passed with no action taken. FYI — informational, no action needed. Noise — automated alerts, verification codes, spam. Mention only as a count, don't list individually. 1–2 sentence bullets per item. Output the summary directly as plain text in your reply — do not create or attach a document, artifact, or file for it.
+```
+
+### Weekly automation
+
+Runs once a week (Friday). Reads `emails_recent.txt` (the 10-day window) and filters within the prompt to the Saturday–Friday range, since the file itself isn't pre-filtered that tightly.
+
+```
+Summarize the emails from the past week. Read emails_recent.txt in this folder directly — never ask about connecting an email account. This file is updated outside this conversation by a scheduled script, so always re-read it fresh; never rely on a cached or previously-read version. It's a rolling window of the last 10 days, appended in chronological order (oldest first, newest last) — only consider entries with a TIME from last Saturday through today (Friday); ignore every older entry still sitting in the file. Title it "Weekly inbox summary ([Sat–Fri date range])". Group emails into these five sections, in this order, and include every section even if empty (say "None" rather than omitting it): Needs action — awaiting a reply or decision from me. Resolved — was actionable but already handled (note how/when). Overdue — deadline has passed with no action taken. FYI — informational, no action needed. Noise — automated alerts, verification codes, spam. Mention only as a count, don't list individually. 1–2 sentence bullets per item. Output the summary directly as plain text in your reply — do not create or attach a document, artifact, or file for it.
+```
 
 ## Privacy note
 
