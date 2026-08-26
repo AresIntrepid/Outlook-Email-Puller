@@ -2,26 +2,71 @@
 # Silent version — no console output, no prompts.
 # Works for any user - paths are relative to their own profile.
 #
-# Maintains TWO output files:
+# Maintains THREE output files:
 #   emails_history.txt  - permanent, cumulative, NEVER trimmed. Full archive, in case you
-#                          ever want to look back further than the recent window below.
+#                          ever want to look back further than the windows below.
 #   emails_recent.txt   - rolling window, trimmed every run to the last $recentWindowDays
-#                          days. This is the small, fast file the daily/weekly summary
-#                          automations should read from — it never grows unbounded.
+#                          days. The weekly summary automation reads this one.
+#   emails_today.txt    - rolling window, trimmed every run to the last $todayWindowHours
+#                          hours. The daily summary automation reads this one instead of
+#                          emails_recent.txt, so it only ever has to read roughly a day's
+#                          worth of data instead of the full 10-day window.
 
 $recentWindowDays = 10   # covers the 7-day weekly summary plus a few days' buffer for a missed run
+$todayWindowHours = 24   # covers the daily summary's "since last run" window
 
 $outDir     = Join-Path $env:USERPROFILE "weekly report"
 if (-not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir | Out-Null
 }
 $historyFile = Join-Path $outDir "emails_history.txt"   # cumulative archive, appended to over time, never trimmed
-$recentFile  = Join-Path $outDir "emails_recent.txt"    # rolling window for the summary automations to read
+$recentFile  = Join-Path $outDir "emails_recent.txt"    # rolling 10-day window - weekly automation reads this
+$todayFile   = Join-Path $outDir "emails_today.txt"     # rolling 24-hour window - daily automation reads this
 $stateFile   = Join-Path $outDir "last_sync_state.txt"  # remembers the newest ReceivedTime we've saved
 $logFile     = Join-Path $outDir "pull_emails_log.txt"
 
 function Write-Log($msg) {
     Add-Content -Path $logFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $msg"
+}
+
+# --- Shared trim logic for both rolling-window files: parses each "---" delimited entry, checks
+#     its TIME field against the given cutoff, and rewrites the file keeping only what's still
+#     within the window. Written once and called once per window file below, rather than copied,
+#     so a future fix to this logic (like the encoding/parsing details) only needs to happen in
+#     one place instead of drifting between two near-identical copies. ---
+function Trim-WindowFile($filePath, $cutoff, $windowLabel) {
+    if (-not (Test-Path $filePath)) { return }
+    $content = Get-Content -Path $filePath -Raw
+    if (-not $content) { return }
+
+    $blocks = $content -split "(?m)^---\r?\n"
+    $kept = New-Object System.Text.StringBuilder
+    $keptCount = 0
+    $droppedCount = 0
+    foreach ($block in $blocks) {
+        if (-not $block.Trim()) { continue }
+        $keepBlock = $true
+        if ($block -match "TIME:\s*(.+)") {
+            $tStr = $matches[1].Trim()
+            try {
+                $t = [datetime]::ParseExact($tStr, "yyyy-MM-dd HH:mm", $null)
+                if ($t -lt $cutoff) { $keepBlock = $false }
+            } catch {
+                # Unparseable timestamp - keep it rather than silently lose an email.
+            }
+        }
+        if ($keepBlock) {
+            [void]$kept.Append("---`r`n")
+            [void]$kept.Append($block)
+            $keptCount++
+        } else {
+            $droppedCount++
+        }
+    }
+    if ($droppedCount -gt 0) {
+        [System.IO.File]::WriteAllText($filePath, $kept.ToString(), [System.Text.Encoding]::UTF8)
+        Write-Log "Trimmed $windowLabel file: kept $keptCount item(s), dropped $droppedCount item(s) outside the window."
+    }
 }
 
 # --- Self-install: the very first time this script runs on a machine, register it with Windows
@@ -61,7 +106,7 @@ try {
 
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $dailyTrigger `
             -Settings $settings -Principal $principal `
-            -Description "Auto-pulls Outlook emails into emails_recent.txt / emails_history.txt for the Claude email summary project." | Out-Null
+            -Description "Auto-pulls Outlook emails into emails_today.txt / emails_recent.txt / emails_history.txt for the Claude email summary project." | Out-Null
 
         Write-Log "First run on this machine - registered Windows Scheduled Task '$taskName' (hourly, 6am-midnight, wakes the computer, catches up on missed runs)."
     }
@@ -79,6 +124,15 @@ try {
 $ns    = $o.GetNamespace("MAPI")
 $inbox = $ns.GetDefaultFolder(6)
 $items = $inbox.Items
+
+# --- Snapshot whatever's currently in the history archive, BEFORE this run adds anything new to
+#     it. Used below to seed any rolling-window file that doesn't exist yet - either because this
+#     is truly the first-ever run, or because it's a window file introduced in a script update on
+#     a machine that's already been running an older version. Taking the snapshot now (before
+#     history gets updated) means seeding a new window file can never double-count this run's own
+#     new items with what gets appended to it further down. ---
+$existingHistoryForSeed = if (Test-Path $historyFile) { Get-Content -Path $historyFile -Raw } else { "" }
+if (-not $existingHistoryForSeed) { $existingHistoryForSeed = "" }
 
 # --- Decide mode: first run (no state file yet) = full history. Otherwise = incremental. ---
 $firstRun = -not (Test-Path $stateFile)
@@ -110,10 +164,12 @@ if ($firstRun) {
     }
 }
 
-$cutoff = (Get-Date).AddDays(-$recentWindowDays)
+$cutoff      = (Get-Date).AddDays(-$recentWindowDays)
+$todayCutoff = (Get-Date).AddHours(-$todayWindowHours)
 
 $sb       = New-Object System.Text.StringBuilder   # goes to history (everything)
-$sbRecent = New-Object System.Text.StringBuilder   # goes to recent (only items within the window)
+$sbRecent = New-Object System.Text.StringBuilder   # goes to recent (only items within the 10-day window)
+$sbToday  = New-Object System.Text.StringBuilder   # goes to today (only items within the 24-hour window)
 $found = 0
 $maxSeen = $null
 
@@ -200,6 +256,9 @@ foreach ($it in $toProcess) {
         if ($rt -ge $cutoff) {
             [void]$sbRecent.Append($entryText)
         }
+        if ($rt -ge $todayCutoff) {
+            [void]$sbToday.Append($entryText)
+        }
         $found++
 
         # Update every 10 items rather than every single one - keeps the UI responsive without
@@ -253,50 +312,31 @@ if ($firstRun) {
     Write-Log "Incremental pull done. Appended $found new item(s) to $historyFile"
 }
 
-# --- Recent file: first run writes it fresh (already filtered to the window); incremental runs append new items. ---
-if ($firstRun) {
-    [System.IO.File]::WriteAllText($recentFile, $sbRecent.ToString(), [System.Text.Encoding]::UTF8)
-} else {
-    if ($sbRecent.Length -gt 0) {
-        [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), [System.Text.Encoding]::UTF8)
-    }
+# --- Recent + today files: if a window file doesn't exist yet - whether this is truly the
+#     first-ever run, or a window file introduced in an update running on a machine that already
+#     has history - seed it from the pre-run history snapshot captured above first, then append
+#     this run's own new items on top (same either way, first run or not). The trim step further
+#     below then cuts whatever's in the file down to its actual window regardless of how it got
+#     there, so a history-seeded file ends up correctly sized just like a freshly-built one. ---
+if (-not (Test-Path $recentFile)) {
+    [System.IO.File]::WriteAllText($recentFile, $existingHistoryForSeed, [System.Text.Encoding]::UTF8)
+}
+if ($sbRecent.Length -gt 0) {
+    [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), [System.Text.Encoding]::UTF8)
 }
 
-# --- Trim the recent file down to the window every run, since old entries age out even with no new mail. ---
-# The recent file stays small forever, so this re-parse is cheap regardless of how big the history file gets.
-if (Test-Path $recentFile) {
-    $recentContent = Get-Content -Path $recentFile -Raw
-    if ($recentContent) {
-        $blocks = $recentContent -split "(?m)^---\r?\n"
-        $kept = New-Object System.Text.StringBuilder
-        $keptCount = 0
-        $droppedCount = 0
-        foreach ($block in $blocks) {
-            if (-not $block.Trim()) { continue }
-            $keepBlock = $true
-            if ($block -match "TIME:\s*(.+)") {
-                $tStr = $matches[1].Trim()
-                try {
-                    $t = [datetime]::ParseExact($tStr, "yyyy-MM-dd HH:mm", $null)
-                    if ($t -lt $cutoff) { $keepBlock = $false }
-                } catch {
-                    # Unparseable timestamp - keep it rather than silently lose an email.
-                }
-            }
-            if ($keepBlock) {
-                [void]$kept.Append("---`r`n")
-                [void]$kept.Append($block)
-                $keptCount++
-            } else {
-                $droppedCount++
-            }
-        }
-        if ($droppedCount -gt 0) {
-            [System.IO.File]::WriteAllText($recentFile, $kept.ToString(), [System.Text.Encoding]::UTF8)
-            Write-Log "Trimmed recent file: kept $keptCount item(s), dropped $droppedCount item(s) older than $recentWindowDays days."
-        }
-    }
+if (-not (Test-Path $todayFile)) {
+    [System.IO.File]::WriteAllText($todayFile, $existingHistoryForSeed, [System.Text.Encoding]::UTF8)
 }
+if ($sbToday.Length -gt 0) {
+    [System.IO.File]::AppendAllText($todayFile, $sbToday.ToString(), [System.Text.Encoding]::UTF8)
+}
+
+# --- Trim both rolling-window files down to their windows every run, since old entries age out
+#     even on a run with no new mail at all. Both files stay small forever, so this re-parse is
+#     cheap regardless of how big the history file gets. Same shared function, two windows. ---
+Trim-WindowFile -filePath $recentFile -cutoff $cutoff -windowLabel "recent (10-day)"
+Trim-WindowFile -filePath $todayFile -cutoff $todayCutoff -windowLabel "today (24-hour)"
 
 # --- Update the sync marker so next run only fetches what's newer than what we just saved. ---
 if ($null -ne $maxSeen) {
