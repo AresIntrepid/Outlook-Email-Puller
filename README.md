@@ -78,6 +78,8 @@ Connect the `weekly report` folder as a project folder in Claude Desktop (Cowork
 
 **Important:** connected folders aren't watched live — Claude can end up working from a cached view of a file instead of what's actually on disk right now. Build your instructions to explicitly say something like *"always re-read this file fresh — never rely on a cached or previously-read version"* rather than assuming it'll notice the file changed on its own.
 
+The exact project instructions and automation prompts used in the reference setup are in [`cowork-instructions.md`](./cowork-instructions.md) — copy them in as-is rather than reconstructing them from scratch.
+
 ## Privacy note
 
 This tool only reads your own inbox and writes to a local file on your own machine — it doesn't send anything over the network. Each person who runs it only gets access to their own mail; there's no way to pull someone else's inbox with this.
