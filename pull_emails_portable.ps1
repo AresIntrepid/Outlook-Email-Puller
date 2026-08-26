@@ -20,6 +20,8 @@
 $recentWindowDays = 10   # covers the 7-day weekly summary plus a few days' buffer for a missed run
 $todayWindowHours = 24   # covers the daily summary's "since last run" window
 $seenIdCap        = 5000 # how many recent EntryIDs to remember for duplicate suppression
+$overlapHours     = 2    # how far back before the marker to re-scan; see the filter notes below
+$maxItemErrorLogs = 10   # per-item failures logged individually before switching to a summary
 
 $outDir = Join-Path $env:USERPROFILE "weekly report"
 if (-not (Test-Path $outDir)) {
@@ -37,7 +39,11 @@ $utf8 = [System.Text.Encoding]::UTF8
 $inv  = [System.Globalization.CultureInfo]::InvariantCulture
 
 function Write-Log($msg) {
-    Add-Content -Path $logFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $msg"
+    # -Encoding UTF8 matters: without it Windows PowerShell writes the active ANSI codepage while
+    # Trim-LogFile below reads and rewrites the file as UTF-8, so any non-ASCII character was
+    # permanently mangled on the next trim. .NET exception messages are localised, so on a
+    # non-English Windows that corrupted exactly the diagnostic lines worth reading.
+    Add-Content -Path $logFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $msg" -Encoding UTF8
 }
 
 # --- Keep the log from growing without bound. Runs hourly forever, so an untrimmed log is a
@@ -82,7 +88,10 @@ function Trim-WindowFile($filePath, $cutoff, $windowLabel) {
     foreach ($block in $blocks) {
         if (-not $block.Trim()) { continue }
         $keepBlock = $true
-        if ($block -match "TIME:\s*(.+)") {
+        # Anchored to the start of a line. Unanchored, a "TIME:" appearing inside a subject or
+        # body would be picked up as the record's timestamp and the block would be kept or
+        # dropped on the wrong date.
+        if ($block -match "(?m)^TIME:\s*(.+)$") {
             $tStr = $matches[1].Trim()
             try {
                 # InvariantCulture, not $null. $null means CurrentCulture, and on a machine whose
@@ -175,6 +184,30 @@ try {
             Set-ScheduledTask -TaskName $taskName -Settings $s | Out-Null
             Write-Log "Repaired existing '$taskName' task: cleared the battery conditions so it runs while unplugged."
         }
+
+        # --- The checks below do NOT auto-repair, they only report. Get-ScheduledTask returning
+        #     an object was previously treated as "the install is healthy", which hid the two
+        #     most common ways this silently stops running forever. Deliberately not fixed
+        #     automatically: re-enabling a task someone disabled on purpose, or rewriting the
+        #     action path, are both decisions the user should make rather than a background
+        #     job making them silently. ---
+        if ($existingTask.State -eq 'Disabled') {
+            Write-Log "WARNING: scheduled task '$taskName' is DISABLED, so it will never run on its own. Re-enable it in Task Scheduler, or run: Enable-ScheduledTask -TaskName '$taskName'"
+        }
+
+        try {
+            $regExe = ($existingTask.Actions | Select-Object -First 1).Execute
+            if ($regExe) {
+                $regExeResolved = [Environment]::ExpandEnvironmentVariables($regExe).Trim('"')
+                # A bare command name (e.g. "powershell.exe") resolves via PATH, so only flag
+                # paths that are rooted and genuinely missing.
+                if ([System.IO.Path]::IsPathRooted($regExeResolved) -and -not (Test-Path $regExeResolved)) {
+                    Write-Log "WARNING: scheduled task '$taskName' points at '$regExeResolved', which no longer exists. Every scheduled run is failing. Delete the task and run this script again from its permanent location to re-register it."
+                }
+            }
+        } catch {
+            # Reporting only - never let this break the pull.
+        }
     }
 } catch {
     Write-Log "WARNING: Could not auto-register or repair the '$taskName' scheduled task ($($_.Exception.Message)). You'll need to set up the recurring run manually in Task Scheduler."
@@ -187,26 +220,45 @@ try {
     exit 1
 }
 
-$ns    = $o.GetNamespace("MAPI")
-$inbox = $ns.GetDefaultFolder(6)
-$items = $inbox.Items
+# GetDefaultFolder throws routinely in the real world - Outlook still building its profile, a
+# corrupt OST, "cannot open your default e-mail folders". Unguarded, the script died here with an
+# unhandled error and wrote NOTHING to the log, so the only trace was a scheduled task quietly
+# recording a non-zero exit code that nobody looks at.
+try {
+    $ns    = $o.GetNamespace("MAPI")
+    $inbox = $ns.GetDefaultFolder(6)
+    $items = $inbox.Items
+} catch {
+    Write-Log "ERROR: Connected to Outlook but could not open the Inbox ($($_.Exception.Message)). Outlook may still be starting up, or the mail profile may need attention."
+    exit 1
+}
 
 # --- Snapshot whatever's currently in the history archive, BEFORE this run adds anything new to
 #     it. Used below to seed any rolling-window file that doesn't exist yet - either because this
 #     is truly the first-ever run, or because it's a window file introduced in a script update on
 #     a machine that's already been running an older version. Taking the snapshot now (before
 #     history gets updated) means seeding a new window file can never double-count this run's own
-#     new items with what gets appended to it further down. ---
-$existingHistoryForSeed = Read-Utf8 $historyFile
-
-# --- Duplicate guard. Two separate things can make the same email come back a second time:
+#     new items with what gets appended to it further down.
 #
-#       1. Outlook's Restrict() comparison on [ReceivedTime] ignores the seconds component, so
-#          "> 09:15:42" behaves like "> 09:15". Anything that arrived later in that same minute
-#          is handed back again on the next run.
+#     Guarded, because this value is consumed at most once ever per window file but the read used
+#     to happen on every single hourly run. emails_history.txt is the one file here that grows
+#     without bound, so an unconditional read meant pulling the entire archive off disk and into
+#     a string 24 times a day, forever, and discarding it. At ~600 emails/week that reaches
+#     hundreds of MB per read within a few years. Read it only when something actually needs it. ---
+$needsHistorySeed = (-not (Test-Path $recentFile)) -or (-not (Test-Path $todayFile))
+$existingHistoryForSeed = ""
+if ($needsHistorySeed) { $existingHistoryForSeed = Read-Utf8 $historyFile }
+
+# --- Duplicate guard. Several separate things can make the same email come back a second time:
+#
+#       1. The scan window deliberately overlaps the marker by $overlapHours, so a normal run
+#          re-fetches everything already saved in that window. That overlap is what protects
+#          against clock changes and filter imprecision, and this guard is what makes it free.
 #       2. A run that dies partway - logoff, shutdown, the 30-minute execution limit - has
 #          already appended to emails_history.txt but never reached the state-file write at the
 #          bottom. The next run starts from the old marker and refetches those same items.
+#       3. A full mailbox scan on a machine that already has an archive, which happens whenever
+#          last_sync_state.txt cannot be read. Every item comes back; only unseen ones are kept.
 #
 #     Reordering the writes doesn't fix this: writing the state marker first would trade
 #     duplicates for permanently LOST email, which is far worse. So instead we remember the
@@ -234,12 +286,31 @@ if ($firstRun) {
     $items.Sort("[ReceivedTime]", $false)  # ascending, so the archive reads oldest -> newest
     $toProcess = $items
 } else {
-    $lastSyncIso = (Read-Utf8 $stateFile).Trim()
+    # Trim() alone is not enough: a UTF-8 byte-order mark surfaces as U+FEFF, which .NET does not
+    # classify as whitespace, and a single stray character here is enough to fail the parse and
+    # send the whole run down the full-scan path.
+    $lastSyncIso = (Read-Utf8 $stateFile).Trim([char]0xFEFF, [char]0x200B).Trim()
     try {
         $lastSync = [datetime]::Parse($lastSyncIso, $inv, [System.Globalization.DateTimeStyles]::RoundtripKind)
     } catch {
-        Write-Log "WARNING: Could not parse last_sync_state.txt ('$lastSyncIso'). Falling back to a full history pull."
+        Write-Log "WARNING: Could not parse last_sync_state.txt ('$lastSyncIso'). Falling back to a full mailbox scan."
         $lastSync = $null
+    }
+
+    # The marker is now written in UTC so that changing timezone (travel) or a DST shift cannot
+    # move it relative to incoming mail. Outlook's ReceivedTime is local wall-clock, so convert
+    # back to local before comparing against it.
+    #
+    # Markers written by older versions have no offset and parse as Unspecified. DateTime's
+    # ToLocalTime() treats Unspecified as UTC, which would shift those by the whole timezone
+    # offset, so tag them Local explicitly instead of converting them.
+    $lastSyncLocal = $null
+    if ($null -ne $lastSync) {
+        if ($lastSync.Kind -eq [System.DateTimeKind]::Utc) {
+            $lastSyncLocal = $lastSync.ToLocalTime()
+        } else {
+            $lastSyncLocal = [datetime]::SpecifyKind($lastSync, [System.DateTimeKind]::Local)
+        }
     }
 
     if ($null -eq $lastSync) {
@@ -262,31 +333,75 @@ if ($firstRun) {
         # freezes the sync marker (it only advances when items are found), so the failure is
         # completely silent: the log just keeps saying "Appended 0 new item(s)".
         #
-        # We also deliberately back the filter off by a few minutes rather than using the exact
-        # marker. Restrict is only a coarse prefilter here; asking for slightly too much is free,
-        # and the EntryID guard above discards anything we've already saved. Being too NARROW,
-        # by contrast, silently drops mail forever. Dropping to minute precision truncates
-        # downward, which widens the window further - also safe, for the same reason.
+        # We also deliberately back the filter off rather than using the exact marker. Restrict is
+        # only a coarse prefilter here; asking for too much is free, because the EntryID guard
+        # discards anything already saved. Being too NARROW silently drops mail forever.
+        #
+        # The overlap is hours, not minutes, specifically to absorb the clock moving backwards:
+        # an NTP correction on a drifted laptop, a DST transition caught by a catch-up run, or a
+        # short timezone change. Any of those can put the marker ahead of incoming mail, and
+        # every minute of that gap is mail no future run would ever fetch. Re-scanning a couple
+        # of hours of already-saved mail costs one property read per item and nothing else.
         $ci = [System.Globalization.CultureInfo]::CurrentCulture
         $fmt = $ci.DateTimeFormat.ShortDatePattern + " " + $ci.DateTimeFormat.ShortTimePattern
-        $filterDate = $lastSync.AddMinutes(-5).ToString($fmt, $ci)
+        $filterDate = $lastSyncLocal.AddHours(-$overlapHours).ToString($fmt, $ci)
         $filter = "[ReceivedTime] > '$filterDate'"
         $toProcess = $items.Restrict($filter)
+        Write-Log "Incremental pull - fetching items received after $filterDate (marker $($lastSync.ToString('o')), $overlapHours-hour overlap, minute-precision filter)."
+
+        # --- Safety net for the entire class of bug that has bitten this script twice now: a
+        #     filter that Outlook accepts and then silently matches nothing. Zero results are
+        #     indistinguishable from a genuinely quiet inbox, which is exactly why the seconds
+        #     bug survived undetected for so long.
+        #
+        #     So when the filter returns nothing, ask the Inbox directly whether it holds anything
+        #     newer than the marker. That is one property read on one item. If it does, the filter
+        #     is lying and we fall back to scanning the whole Inbox for this run - slower, but the
+        #     EntryID guard makes it correct, and it self-heals instead of quietly losing mail.
+        #     This also covers the locale hazards the culture-formatted filter still carries
+        #     (non-Gregorian calendars, bidi marks, ICU's narrow no-break space before AM/PM). ---
+        $restrictCount = -1
+        try { $restrictCount = $toProcess.Count } catch { $restrictCount = -1 }
+
+        if ($restrictCount -le 0) {
+            try {
+                $items.Sort("[ReceivedTime]", $true)   # descending, so the first item is newest
+                $newestInInbox = $null
+                foreach ($probe in $items) { $newestInInbox = $probe.ReceivedTime; break }
+
+                if ($null -ne $newestInInbox -and $newestInInbox -gt $lastSyncLocal) {
+                    Write-Log "ERROR: filter '$filter' matched 0 items, but the Inbox holds mail newer than the marker (newest $($newestInInbox.ToString('yyyy-MM-dd HH:mm'))). The filter is not working on this machine. Falling back to a full Inbox scan for this run."
+                    $toProcess = $items
+                }
+            } catch {
+                Write-Log "WARNING: could not verify the empty filter result ($($_.Exception.Message))."
+            }
+        }
+
         $toProcess.Sort("[ReceivedTime]", $false)
-        Write-Log "Incremental pull - fetching items received after $filterDate (marker $($lastSync.ToString('o')), 5-minute overlap, minute-precision filter)."
     }
 }
 
-# --- A full-history run must IGNORE the seen-id list, not honour it. The history write below is
-#     WriteAllText (a full overwrite) on a first run, so if a stale seen_ids.txt survived - e.g.
-#     someone deleted last_sync_state.txt to force a clean re-pull but left seen_ids.txt behind -
-#     every one of those ids would be skipped and the rebuilt archive would silently come back
-#     missing the most recent few thousand emails. There's no marker to resume from on a full run,
-#     so nothing can be a duplicate within it; the list is rebuilt from scratch as we go. ---
-if ($firstRun -and $seenIds.Count -gt 0) {
-    Write-Log "Full history pull - discarding the existing seen_ids.txt ($($seenIds.Count) id(s)) so the rebuilt archive is complete."
-    $seenIds.Clear()
-    $seenOrder.Clear()
+# --- Whether this run is allowed to OVERWRITE the permanent archive, as opposed to appending to
+#     it. This is deliberately much narrower than $firstRun.
+#
+#     $firstRun means "scan the whole mailbox", and it gets set not only on a genuine first run
+#     but any time last_sync_state.txt cannot be read - a transient file lock from OneDrive, an
+#     antivirus scan, a 0-byte file left by a run killed mid-write. Wiring an unrecoverable
+#     WriteAllText on emails_history.txt to that condition meant a momentary hiccup on a
+#     bookkeeping file could replace years of archive with "whatever is in the Inbox right now",
+#     silently, under a log line reading "Full history pull done."
+#
+#     So: overwrite ONLY when there is demonstrably nothing to lose. In every other case the
+#     archive is append-only, and the EntryID guard keeps a full rescan from duplicating what is
+#     already in there. That also removes the old need to discard seen_ids.txt on a full run,
+#     which is why that block is gone - the guard now stays armed, which is what stops a forced
+#     re-pull from appending a second copy of the last 10 days into the rolling window files. ---
+$historyHasContent = (Test-Path $historyFile) -and ((Get-Item $historyFile).Length -gt 0)
+$rebuildHistory    = $firstRun -and (-not $historyHasContent)
+
+if ($firstRun -and $historyHasContent) {
+    Write-Log "Full mailbox scan with an existing archive present - appending only unseen items rather than overwriting $historyFile ($($seenIds.Count) known id(s))."
 }
 
 $cutoff      = (Get-Date).AddDays(-$recentWindowDays)
@@ -295,9 +410,11 @@ $todayCutoff = (Get-Date).AddHours(-$todayWindowHours)
 $sb       = New-Object System.Text.StringBuilder   # goes to history (everything)
 $sbRecent = New-Object System.Text.StringBuilder   # goes to recent (only items within the 10-day window)
 $sbToday  = New-Object System.Text.StringBuilder   # goes to today (only items within the 24-hour window)
-$found    = 0
-$skipped  = 0
-$maxSeen  = $null
+$found         = 0
+$skipped       = 0
+$maxSeen       = $null
+$itemErrors    = 0
+$oldestFailure = $null   # ReceivedTime of the earliest item this run failed to save; see below
 
 # --- Progress window: only for the first-ever run (the full history pull), since that's the only
 #     run slow enough to need one. Every run after this is a fast incremental pull (a handful of
@@ -359,19 +476,24 @@ if ($firstRun -and $totalToProcess -gt 0) {
 }
 
 foreach ($it in $toProcess) {
+    $rt = $null   # hoisted so the catch below can tell how far back a failure reaches
     try {
-        # Duplicate guard, checked before anything is written. Non-mail items (meeting responses,
-        # delivery reports) can fail to expose an EntryID; those fall through and are handled by
-        # the property reads below, which throw into the catch and get skipped anyway.
+        # Duplicate guard, checked before anything is written.
         $eid = $null
         try { $eid = $it.EntryID } catch { $eid = $null }
         if ($eid -and $seenIds.Contains($eid)) {
             $skipped++
+            # This item is already saved, so the marker may safely move past it. Without this the
+            # marker sat still whenever everything in range had already been seen, which left the
+            # scan window permanently wider than it needed to be.
+            try {
+                $rtSeen = $it.ReceivedTime
+                if ($null -eq $maxSeen -or $rtSeen -gt $maxSeen) { $maxSeen = $rtSeen }
+            } catch { }
             continue
         }
 
         $rt = $it.ReceivedTime
-        if ($null -eq $maxSeen -or $rt -gt $maxSeen) { $maxSeen = $rt }
 
         # InvariantCulture here too - Trim-WindowFile above parses this exact string back out with
         # $inv, so writing it with the machine's CurrentCulture (e.g. a locale where ":" isn't the
@@ -382,7 +504,30 @@ foreach ($it in $toProcess) {
         $subj = $it.Subject
         $body = $it.Body
         if ($body -and $body.Length -gt 1500) { $body = $body.Substring(0, 1500) }
-        $body = ($body -replace "\r?\n", " ").Trim()
+
+        # Every field is flattened to a single line, not just the body. The record format is
+        # line-oriented and "---" on its own line separates records, so a newline inside a sender
+        # display name or subject splits one record into two. The orphan half has no TIME: line,
+        # which means the rolling-window trim keeps it forever, and every downstream reader sees a
+        # phantom email. Display names on unresolved external mail come from the From: header and
+        # are not under our control.
+        $from = ($from -replace "[\r\n]+", " ").Trim()
+        $subj = ($subj -replace "[\r\n]+", " ").Trim()
+        $body = ($body -replace "[\r\n]+", " ").Trim()
+
+        # Some items expose no usable EntryID. Previously those fell through with $eid still null,
+        # so nothing was ever recorded in seen_ids and the SAME email was re-appended on every
+        # single run until newer mail pushed the window past it - dozens of copies over a quiet
+        # weekend, each logged as a perfectly ordinary "Appended 1 new item(s)". Fall back to a
+        # content key so the duplicate guard still has something to hold onto.
+        if (-not $eid) {
+            $eid = "NOEID|$time|$from|$subj"
+            if ($seenIds.Contains($eid)) {
+                $skipped++
+                if ($null -eq $maxSeen -or $rt -gt $maxSeen) { $maxSeen = $rt }
+                continue
+            }
+        }
 
         $entry = New-Object System.Text.StringBuilder
         [void]$entry.AppendLine("---")
@@ -397,7 +542,16 @@ foreach ($it in $toProcess) {
         if ($rt -ge $cutoff)      { [void]$sbRecent.Append($entryText) }
         if ($rt -ge $todayCutoff) { [void]$sbToday.Append($entryText) }
 
-        if ($eid -and $seenIds.Add($eid)) { [void]$seenOrder.Add($eid) }
+        if ($seenIds.Add($eid)) { [void]$seenOrder.Add($eid) }
+
+        # --- The marker advances LAST, and only for an item that is now genuinely captured.
+        #     It used to advance immediately after reading ReceivedTime, before SenderName,
+        #     Subject and Body - any of which throw in normal operation on rights-protected mail,
+        #     delivery reports, or an Outlook that is busy syncing. When one did, the item was
+        #     skipped but the marker had already moved past it, so the next run's window started
+        #     after an email that was never saved and no future run would ever fetch it again.
+        #     Silent, permanent loss out of a file documented as a complete archive. ---
+        if ($null -eq $maxSeen -or $rt -gt $maxSeen) { $maxSeen = $rt }
         $found++
 
         # Update every 10 items rather than every single one - keeps the UI responsive without
@@ -409,8 +563,29 @@ foreach ($it in $toProcess) {
             [System.Windows.Forms.Application]::DoEvents()
         }
     } catch {
-        Write-Log "Error processing an item, skipped it."
+        $itemErrors++
+
+        # Remember how far back the damage reaches. The marker is clamped to sit before this
+        # below, so a failed item is retried on the next run instead of being stepped over.
+        if ($null -ne $rt -and ($null -eq $oldestFailure -or $rt -lt $oldestFailure)) {
+            $oldestFailure = $rt
+        }
+
+        # The old message was "Error processing an item, skipped it." with no identifying detail
+        # at all, so there was no way to tell one unreadable delivery receipt from forty real
+        # emails. Log enough to identify it - but cap the individual lines, because a mass failure
+        # would otherwise write thousands of entries and Trim-LogFile would then scroll the
+        # evidence out of the log within the same run.
+        if ($itemErrors -le $maxItemErrorLogs) {
+            $whenStr = "unknown time"
+            if ($null -ne $rt) { $whenStr = $rt.ToString("yyyy-MM-dd HH:mm", $inv) }
+            Write-Log "WARNING: could not save the item received $whenStr ($($_.Exception.Message))."
+        }
     }
+}
+
+if ($itemErrors -gt $maxItemErrorLogs) {
+    Write-Log "WARNING: $itemErrors item(s) failed this run; only the first $maxItemErrorLogs were logged individually."
 }
 
 if ($progressForm) {
@@ -440,15 +615,16 @@ if ($progressForm) {
     $progressForm.Dispose()
 }
 
-# --- History file: full history pull overwrites/creates the archive; incremental pulls append to it. Never trimmed. ---
-if ($firstRun) {
+# --- History file. Never trimmed, and only ever overwritten when there was demonstrably nothing
+#     in it to lose (see $rebuildHistory above). Every other path appends. ---
+if ($rebuildHistory) {
     [System.IO.File]::WriteAllText($historyFile, $sb.ToString(), $utf8)
-    Write-Log "Full history pull done. Wrote $found items to $historyFile"
+    Write-Log "Full history pull done. Wrote $found item(s) to $historyFile"
 } else {
     if ($found -gt 0) {
         [System.IO.File]::AppendAllText($historyFile, $sb.ToString(), $utf8)
     }
-    Write-Log "Incremental pull done. Appended $found new item(s) to $historyFile ($skipped already-seen item(s) skipped)."
+    Write-Log "Incremental pull done. Appended $found new item(s) to $historyFile ($skipped already-seen item(s) skipped, $itemErrors error(s))."
 }
 
 # --- Recent + today files: if a window file doesn't exist yet - whether this is truly the
@@ -457,18 +633,26 @@ if ($firstRun) {
 #     this run's own new items on top (same either way, first run or not). The trim step further
 #     below then cuts whatever's in the file down to its actual window regardless of how it got
 #     there, so a history-seeded file ends up correctly sized just like a freshly-built one. ---
-if (-not (Test-Path $recentFile)) {
-    [System.IO.File]::WriteAllText($recentFile, $existingHistoryForSeed, $utf8)
-}
-if ($sbRecent.Length -gt 0) {
-    [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), $utf8)
-}
+if ($rebuildHistory) {
+    # Building everything from nothing, so write the window files outright rather than seeding
+    # and appending. $sbRecent and $sbToday already hold exactly the in-window items from this
+    # full scan, and the archive they would have been seeded from is this same run's output.
+    [System.IO.File]::WriteAllText($recentFile, $sbRecent.ToString(), $utf8)
+    [System.IO.File]::WriteAllText($todayFile,  $sbToday.ToString(),  $utf8)
+} else {
+    if (-not (Test-Path $recentFile)) {
+        [System.IO.File]::WriteAllText($recentFile, $existingHistoryForSeed, $utf8)
+    }
+    if ($sbRecent.Length -gt 0) {
+        [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), $utf8)
+    }
 
-if (-not (Test-Path $todayFile)) {
-    [System.IO.File]::WriteAllText($todayFile, $existingHistoryForSeed, $utf8)
-}
-if ($sbToday.Length -gt 0) {
-    [System.IO.File]::AppendAllText($todayFile, $sbToday.ToString(), $utf8)
+    if (-not (Test-Path $todayFile)) {
+        [System.IO.File]::WriteAllText($todayFile, $existingHistoryForSeed, $utf8)
+    }
+    if ($sbToday.Length -gt 0) {
+        [System.IO.File]::AppendAllText($todayFile, $sbToday.ToString(), $utf8)
+    }
 }
 
 # --- Trim both rolling-window files down to their windows every run, since old entries age out
@@ -492,12 +676,31 @@ try {
     Write-Log "WARNING: Could not write seen_ids.txt ($($_.Exception.Message)). Duplicate suppression may be degraded next run."
 }
 
-# --- Update the sync marker so next run only fetches what's newer than what we just saved. ---
+# --- Hold the marker behind anything this run failed to save, so the next run gets another go at
+#     it instead of stepping over it permanently. A genuinely unreadable item therefore stalls the
+#     marker and keeps logging a warning every hour, which is noisy on purpose: the alternative is
+#     losing the email in silence. The stall is bounded so the rescan window can never outgrow the
+#     $seenIdCap ids that keep the rescan from producing duplicates - past that point the item is
+#     given up on, loudly, rather than degrading the whole tool. ---
+if ($null -ne $oldestFailure -and $null -ne $maxSeen -and $maxSeen -ge $oldestFailure) {
+    $stallFloor = (Get-Date).AddDays(-$recentWindowDays)
+    if ($oldestFailure -lt $stallFloor) {
+        Write-Log "ERROR: an item received $($oldestFailure.ToString('yyyy-MM-dd HH:mm', $inv)) has failed to save for over $recentWindowDays days. Giving up on it and advancing the marker; that email will not appear in the archive."
+    } else {
+        $maxSeen = $oldestFailure.AddSeconds(-1)
+        Write-Log "WARNING: holding the sync marker at $($maxSeen.ToString('yyyy-MM-dd HH:mm:ss', $inv)) so the $itemErrors failed item(s) are retried next run."
+    }
+}
+
+# --- Update the sync marker so next run only fetches what's newer than what we just saved.
+#     Stored in UTC: the marker is compared against Outlook's local ReceivedTime, so keeping it as
+#     local wall-clock meant a timezone change or DST shift moved the marker relative to incoming
+#     mail and silently skipped everything in the gap. ---
 if ($null -ne $maxSeen) {
-    Set-Content -Path $stateFile -Value $maxSeen.ToString("o") -NoNewline
+    Set-Content -Path $stateFile -Value $maxSeen.ToUniversalTime().ToString("o") -Encoding UTF8 -NoNewline
 } elseif ($firstRun) {
     # Empty mailbox on a first run - still record a starting point so future runs behave correctly.
-    Set-Content -Path $stateFile -Value (Get-Date).ToString("o") -NoNewline
+    Set-Content -Path $stateFile -Value (Get-Date).ToUniversalTime().ToString("o") -Encoding UTF8 -NoNewline
 }
 
 Trim-LogFile -path $logFile -maxLines 2000
