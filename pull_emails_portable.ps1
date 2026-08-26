@@ -117,6 +117,65 @@ $sbRecent = New-Object System.Text.StringBuilder   # goes to recent (only items 
 $found = 0
 $maxSeen = $null
 
+# --- Progress window: only for the first-ever run (the full history pull), since that's the only
+#     run slow enough to need one. Every run after this is a fast incremental pull (a handful of
+#     items, done in a second or two) and stays completely silent, including on the hourly
+#     scheduled runs - this window is a one-time thing the user sees exactly once, ever. ---
+$totalToProcess = 0
+if ($firstRun) {
+    try { $totalToProcess = $toProcess.Count } catch { $totalToProcess = 0 }
+}
+
+$progressForm  = $null
+$progressBar   = $null
+$progressLabel = $null
+
+if ($firstRun -and $totalToProcess -gt 0) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+
+        $progressForm = New-Object System.Windows.Forms.Form
+        $progressForm.Text            = "Setting up email sync"
+        $progressForm.Width           = 420
+        $progressForm.Height          = 140
+        $progressForm.StartPosition   = "CenterScreen"
+        $progressForm.FormBorderStyle = "FixedDialog"
+        $progressForm.ControlBox      = $false
+        $progressForm.MaximizeBox     = $false
+        $progressForm.MinimizeBox     = $false
+        $progressForm.TopMost         = $true
+
+        $progressLabel = New-Object System.Windows.Forms.Label
+        $progressLabel.Text     = "Pulling your full inbox history for the first time (0 / $totalToProcess)..."
+        $progressLabel.AutoSize = $false
+        $progressLabel.Width    = 380
+        $progressLabel.Height   = 40
+        $progressLabel.Top      = 15
+        $progressLabel.Left     = 15
+        $progressForm.Controls.Add($progressLabel)
+
+        $progressBar = New-Object System.Windows.Forms.ProgressBar
+        $progressBar.Minimum = 0
+        $progressBar.Maximum = $totalToProcess
+        $progressBar.Value   = 0
+        $progressBar.Width   = 380
+        $progressBar.Height  = 25
+        $progressBar.Top     = 60
+        $progressBar.Left    = 15
+        $progressForm.Controls.Add($progressBar)
+
+        $progressForm.Show()
+        $progressForm.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+    } catch {
+        # If Windows Forms isn't available for some reason, just skip the UI silently -
+        # the pull itself must never fail because a progress bar couldn't be shown.
+        Write-Log "WARNING: Could not show the first-run progress window ($($_.Exception.Message)). Continuing without it."
+        $progressForm = $null
+    }
+}
+
 foreach ($it in $toProcess) {
     try {
         $rt = $it.ReceivedTime
@@ -142,9 +201,45 @@ foreach ($it in $toProcess) {
             [void]$sbRecent.Append($entryText)
         }
         $found++
+
+        # Update every 10 items rather than every single one - keeps the UI responsive without
+        # slowing the pull down with constant repaints on a large mailbox.
+        if ($progressForm -and ($found % 10 -eq 0 -or $found -eq $totalToProcess)) {
+            $progressBar.Value    = [Math]::Min($found, $totalToProcess)
+            $progressLabel.Text   = "Pulling your full inbox history for the first time ($found / $totalToProcess)..."
+            $progressForm.Refresh()
+            [System.Windows.Forms.Application]::DoEvents()
+        }
     } catch {
         Write-Log "Error processing an item, skipped it."
     }
+}
+
+if ($progressForm) {
+    # Hold the finished state on screen for a moment so it's actually readable - on a small
+    # mailbox the whole pull can finish in well under a second, which would otherwise make the
+    # window flash and vanish before anyone can see it. This adds nothing noticeable on a large
+    # mailbox, where the pull itself already takes minutes.
+    $progressLabel.Text = "Done - saved $found email(s)."
+
+    # The native Windows progress bar animates a value change over a short fill transition rather
+    # than snapping instantly. Nudge it down then back up to Maximum to force an immediate
+    # redraw instead of an animated one, so it visibly reads 100% right away.
+    $progressBar.Value = $totalToProcess
+    if ($totalToProcess -gt 0) { $progressBar.Value = $totalToProcess - 1 }
+    $progressBar.Value = $totalToProcess
+
+    # Keep pumping Windows messages for the whole hold - a plain Start-Sleep here would freeze
+    # the message loop entirely, leaving the bar's fill animation visibly stuck mid-transition
+    # for the whole hold instead of showing it complete.
+    $holdUntil = (Get-Date).AddMilliseconds(1500)
+    while ((Get-Date) -lt $holdUntil) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 50
+    }
+
+    $progressForm.Close()
+    $progressForm.Dispose()
 }
 
 # --- History file: full history pull overwrites/creates the archive; incremental pulls append to it. Never trimmed. ---
