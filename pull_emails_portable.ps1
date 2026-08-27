@@ -157,36 +157,55 @@ function Trim-WindowFile($filePath, $cutoff, $windowLabel) {
 # data (e.g. one process reading a window file mid-write by the other). A lock older than
 # $lockStaleMinutes whose owning process is no longer running is treated as abandoned and reclaimed
 # rather than permanently wedging the script.
-function Acquire-Lock($path, $staleMinutes) {
-    if (Test-Path $path) {
-        $isStale = $true
-        try {
-            $raw   = (Read-Utf8 $path).Trim()
-            $parts = $raw -split '\|'
-            if ($parts.Count -ge 2) {
-                $lockPid  = 0
-                $parsedPid = [int]::TryParse($parts[0], [ref]$lockPid)
-                $lockTime = $null
-                try { $lockTime = [datetime]::Parse($parts[1], $inv, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { $lockTime = $null }
-                $ownerAlive = $false
-                if ($parsedPid -and $lockPid -gt 0) {
-                    try { Get-Process -Id $lockPid -ErrorAction Stop | Out-Null; $ownerAlive = $true } catch { $ownerAlive = $false }
-                }
-                if ($ownerAlive -and $null -ne $lockTime -and ((Get-Date) - $lockTime) -lt (New-TimeSpan -Minutes $staleMinutes)) {
-                    $isStale = $false
-                }
-            }
-        } catch {
-            # Unreadable/corrupt lock file - treat as stale and reclaim it.
-        }
-        if (-not $isStale) { return $false }
-    }
+#
+# The actual claim is done with FileMode.CreateNew, which atomically fails if the file already
+# exists - a plain "if not Test-Path then Set-Content" is NOT atomic (two instances can both pass
+# the check before either writes, and both then believe they hold the lock); CreateNew is a single
+# OS-level operation that only one caller can ever win.
+function Try-ClaimLockFile($path, $content) {
     try {
-        Set-Content -Path $path -Value "$PID|$((Get-Date).ToUniversalTime().ToString('o'))" -Encoding UTF8 -NoNewline
+        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($content)
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally { $fs.Close() }
         return $true
-    } catch {
+    } catch [System.IO.IOException] {
         return $false
     }
+}
+function Acquire-Lock($path, $staleMinutes) {
+    $content = "$PID|$((Get-Date).ToUniversalTime().ToString('o'))"
+    if (Try-ClaimLockFile $path $content) { return $true }
+    # Someone already holds the file (or a stale leftover is sitting there) - decide whether to
+    # reclaim it. This read-and-decide step doesn't need to be atomic: whatever we decide here,
+    # the actual reclaim below still goes through the same atomic CreateNew, so a second instance
+    # racing this same decision can still only win once.
+    $isStale = $true
+    try {
+        $raw   = (Read-Utf8 $path).Trim()
+        $parts = $raw -split '\|'
+        if ($parts.Count -ge 2) {
+            $lockPid  = 0
+            $parsedPid = [int]::TryParse($parts[0], [ref]$lockPid)
+            $lockTime = $null
+            try { $lockTime = [datetime]::Parse($parts[1], $inv, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { $lockTime = $null }
+            $ownerAlive = $false
+            if ($parsedPid -and $lockPid -gt 0) {
+                try { Get-Process -Id $lockPid -ErrorAction Stop | Out-Null; $ownerAlive = $true } catch { $ownerAlive = $false }
+            }
+            if ($ownerAlive -and $null -ne $lockTime -and ((Get-Date) - $lockTime) -lt (New-TimeSpan -Minutes $staleMinutes)) {
+                $isStale = $false
+            }
+        }
+    } catch {
+        # Unreadable/corrupt lock file - treat as stale and reclaim it.
+    }
+    if (-not $isStale) { return $false }
+    try { Remove-Item -Path $path -Force -ErrorAction SilentlyContinue } catch { }
+    # Re-attempt through the same atomic claim rather than an unconditional overwrite - if another
+    # instance reclaims first, this correctly loses instead of both instances proceeding.
+    return (Try-ClaimLockFile $path $content)
 }
 function Release-Lock($path) {
     try { if (Test-Path $path) { Remove-Item -Path $path -Force -ErrorAction SilentlyContinue } } catch {
@@ -417,36 +436,64 @@ function Flush-Checkpoint {
     }
 
     # Recent (10-day) file
+    # NOTE: the seed-from-history step below re-reads emails_history.txt FRESH every time it's
+    # attempted, rather than reusing the one-time $existingHistoryForSeed snapshot taken before
+    # the loop started. This matters once checkpointing is in the picture: if the seed read fails
+    # on an early checkpoint, we must NOT mark recentInitialized=true anyway, because every later
+    # branch below only knows how to append (via AppendAllText, which silently CREATES the file
+    # if it's missing) - if that branch ran first, the file would end up existing but permanently
+    # missing its historical backfill, and since it now exists, $needsHistorySeed would be false
+    # on every future run, so it could never be seeded at all. Deferring (not marking initialized)
+    # keeps retrying at each later checkpoint and the final flush until the read actually succeeds
+    # (or the history file is confirmed genuinely empty), and loses nothing in the meantime: any
+    # items buffered for this file while deferred are already durably written to emails_history.txt
+    # by the History-file section above, and get picked back up automatically once the seed finally
+    # succeeds, because that fresh read naturally includes everything appended so far.
     if (-not $script:recentInitialized) {
         if ($rebuildHistory) {
             [System.IO.File]::WriteAllText($recentFile, $sbRecent.ToString(), $utf8)
+            $script:recentInitialized = $true
         } elseif (-not (Test-Path $recentFile)) {
-            if (-not $historySeedFailed) {
-                [System.IO.File]::WriteAllText($recentFile, $existingHistoryForSeed, $utf8)
-                if ($sbRecent.Length -gt 0) { [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), $utf8) }
+            $seedNow = Read-Utf8 $historyFile
+            $histLenNow = 0
+            if (Test-Path $historyFile) { try { $histLenNow = (Get-Item $historyFile).Length } catch { $histLenNow = 0 } }
+            if ($seedNow -or $histLenNow -eq 0) {
+                # Successful read (or the archive is legitimately empty, e.g. a brand-new mailbox) -
+                # $seedNow already reflects everything written to $historyFile so far THIS run
+                # (including this checkpoint's own new items, appended just above), so do NOT also
+                # append $sbRecent here - that would duplicate them.
+                [System.IO.File]::WriteAllText($recentFile, $seedNow, $utf8)
+                $script:recentInitialized = $true
+            } else {
+                Write-Log "WARNING: still could not read $historyFile to seed $recentFile as of this checkpoint (locked, or a transient share violation) - deferring again."
             }
-            # If seeding failed, deliberately leave it uncreated - see $historySeedFailed notes above.
-        } elseif ($sbRecent.Length -gt 0) {
-            [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), $utf8)
+        } else {
+            if ($sbRecent.Length -gt 0) { [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), $utf8) }
+            $script:recentInitialized = $true
         }
-        $script:recentInitialized = $true
     } elseif ($sbRecent.Length -gt 0) {
         [System.IO.File]::AppendAllText($recentFile, $sbRecent.ToString(), $utf8)
     }
 
-    # Today (24-hour) file - mirrors the recent-file logic above
+    # Today (24-hour) file - mirrors the recent-file logic above, same reasoning
     if (-not $script:todayInitialized) {
         if ($rebuildHistory) {
             [System.IO.File]::WriteAllText($todayFile, $sbToday.ToString(), $utf8)
+            $script:todayInitialized = $true
         } elseif (-not (Test-Path $todayFile)) {
-            if (-not $historySeedFailed) {
-                [System.IO.File]::WriteAllText($todayFile, $existingHistoryForSeed, $utf8)
-                if ($sbToday.Length -gt 0) { [System.IO.File]::AppendAllText($todayFile, $sbToday.ToString(), $utf8) }
+            $seedNow = Read-Utf8 $historyFile
+            $histLenNow = 0
+            if (Test-Path $historyFile) { try { $histLenNow = (Get-Item $historyFile).Length } catch { $histLenNow = 0 } }
+            if ($seedNow -or $histLenNow -eq 0) {
+                [System.IO.File]::WriteAllText($todayFile, $seedNow, $utf8)
+                $script:todayInitialized = $true
+            } else {
+                Write-Log "WARNING: still could not read $historyFile to seed $todayFile as of this checkpoint (locked, or a transient share violation) - deferring again."
             }
-        } elseif ($sbToday.Length -gt 0) {
-            [System.IO.File]::AppendAllText($todayFile, $sbToday.ToString(), $utf8)
+        } else {
+            if ($sbToday.Length -gt 0) { [System.IO.File]::AppendAllText($todayFile, $sbToday.ToString(), $utf8) }
+            $script:todayInitialized = $true
         }
-        $script:todayInitialized = $true
     } elseif ($sbToday.Length -gt 0) {
         [System.IO.File]::AppendAllText($todayFile, $sbToday.ToString(), $utf8)
     }
