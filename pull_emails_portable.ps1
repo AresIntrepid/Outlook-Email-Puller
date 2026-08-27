@@ -67,6 +67,7 @@ $maxItemErrorLogs          = 10    # per-item failures logged individually befor
 $checkpointInterval        = 250   # items processed between incremental disk flushes during a run
 $maxUnknownTimeFailureRuns = 3     # consecutive runs an unreadable-timestamp item is retried before giving up on it
 $lockStaleMinutes          = 60    # a lock file older than this AND whose owning PID is gone/dead is reclaimed
+$dailyCacheRetentionDays   = 14    # daily_cache_YYYY-MM-DD.txt files older than this are deleted - see Trim-DailyCacheFiles notes below
 
 $outDir = Join-Path $env:USERPROFILE "weekly report"
 if (-not (Test-Path $outDir)) {
@@ -147,6 +148,46 @@ function Trim-WindowFile($filePath, $cutoff, $windowLabel) {
     if ($droppedCount -gt 0) {
         [System.IO.File]::WriteAllText($filePath, $kept.ToString(), $utf8)
         Write-Log "Trimmed $windowLabel file: kept $keptCount item(s), dropped $droppedCount item(s) outside the window."
+    }
+}
+function Trim-DailyCacheFiles($dir, $retentionDays) {
+    # The daily/weekly Claude Desktop automations write daily_cache_YYYY-MM-DD.txt files here as a
+    # byproduct of the caching scheme (see the daily/weekly prompt instructions) so repeated runs
+    # don't re-derive the same calendar day's categorization from raw email text. Nothing ever
+    # reads a cache file older than the weekly lookback window, so left alone this would grow by
+    # one small file per day forever with zero benefit past that point. This is intentionally done
+    # HERE (a script that runs hourly on its own schedule) rather than as an instruction inside the
+    # chat prompts, because file deletion by date is a purely mechanical decision that doesn't need
+    # an LLM's judgment, and because it must not depend on the person remembering to trigger a
+    # daily/weekly summary chat on any particular cadence - this way cleanup happens on schedule
+    # regardless of whether those automations are ever opened.
+    if (-not (Test-Path $dir)) { return }
+    $cutoff = (Get-Date).Date.AddDays(-$retentionDays)
+    $deleted = 0
+    try {
+        $candidates = Get-ChildItem -Path $dir -Filter "daily_cache_*.txt" -File -ErrorAction SilentlyContinue
+    } catch {
+        Write-Log "WARNING: could not list daily_cache_*.txt files in $dir for retention cleanup ($($_.Exception.Message))."
+        return
+    }
+    foreach ($f in $candidates) {
+        if ($f.Name -match '^daily_cache_(\d{4}-\d{2}-\d{2})\.txt$') {
+            $fileDate = $null
+            try { $fileDate = [datetime]::ParseExact($matches[1], "yyyy-MM-dd", $inv) } catch { $fileDate = $null }
+            if ($null -ne $fileDate -and $fileDate -lt $cutoff) {
+                try {
+                    Remove-Item -Path $f.FullName -Force -ErrorAction Stop
+                    $deleted++
+                } catch {
+                    Write-Log "WARNING: could not delete stale daily cache file '$($f.Name)' ($($_.Exception.Message))."
+                }
+            }
+        }
+        # Filenames that don't match the expected pattern are left alone rather than guessed at -
+        # better to leak one unrecognized file than to delete something unrelated by mistake.
+    }
+    if ($deleted -gt 0) {
+        Write-Log "Retention cleanup: deleted $deleted daily cache file(s) older than $retentionDays day(s)."
     }
 }
 
@@ -688,6 +729,7 @@ if ($rebuildHistory) {
 
 Trim-WindowFile -filePath $recentFile -cutoff $cutoff -windowLabel "recent (10-day)"
 Trim-WindowFile -filePath $todayFile  -cutoff $todayCutoff -windowLabel "today (24-hour)"
+Trim-DailyCacheFiles -dir $outDir -retentionDays $dailyCacheRetentionDays
 
 # --- Whether it's safe to give up on the oldest failure and advance past it depends on whether
 #     anything else this run actually worked. If some mail saved, or was recognized as already
